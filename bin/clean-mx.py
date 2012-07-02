@@ -15,6 +15,7 @@ import hashlib
 import subprocess
 from glob import glob
 import pprint
+import magicFileExtension
 
 MINUTE = 60
 HOUR = MINUTE * 60
@@ -120,8 +121,17 @@ def main():
 						print("Renaming " + filename + " to " + newFilename)
 						os.rename(filename, newFilename)
 						filename = newFilename
+
+					# Add the correct file extension
+					extension=magicFileExtension.getExt(filename)
+
+					if( len(extension) > 0):
+						print("Renaming " + filename + " to " + filename + extension)
+						os.rename(filename, filename + extension)
+					
 				except Exception as e:
 					print("Error while downloading " + urlString + " %s" % e)
+
 			#else:
 				#print ("Not downloading " + urlString + " - already exists")
 		else:
