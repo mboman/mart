@@ -31,9 +31,14 @@ import urlparse
 from optparse import OptionParser
 
 try:
-    from sqlite3 import *
+    import sqlalchemy
+    from sqlalchemy import create_engine
+    from sqlalchemy.sql import select,insert,delete
+    from sqlalchemy import Table, Column, Integer, String, MetaData, ForeignKey, Sequence, func, and_
+    DBENABLED=True
 except ImportError:
-    print "Cannot import sqlite3, the database function is disabled."
+    print "Cannot import sqlalchemy, the database function is disabled."
+    DBENABLED=False
 
 # This should be stock with Python2.6 but not supplied in Python2.5
 try:
@@ -41,7 +46,7 @@ try:
 except ImportError:
     print 'You must install simplejson for VirusTotal, see http://www.undefined.org/python/'
             
-DBNAME  = "virus.db"
+DBNAME  = "sqlite:///virus.db"
 MAXWAIT = (60*10) # ten minutes 
 
 # You must fill this in for VirusTotal (see http://www.virustotal.com/advanced.html)
@@ -561,85 +566,69 @@ class VirusTotal:
                 i += 1
         return {}
 
-def savetodb(filename, detects, force):
-    
-    if len(detects) == 0:
+def savetodb(filename, virusresults):
+    if len(virusresults) == 0:
         print "Nothing to add, submission failed."
         return
-    
-    if not os.path.isfile(DBNAME):
-        print "%s does not exist, try initialization first." % DBNAME
-        return
-        
-    conn = connect(DBNAME)
-    curs = conn.cursor()
-    
+
     md5 = hashlib.md5(open(filename, 'rb').read()).hexdigest()
-    
-    curs.execute("SELECT id FROM samples WHERE md5=?", (md5,))
-    ids = curs.fetchall()
-   
-    if len(ids):
-        if not force:
-            ids = ["%d" % id[0] for id in ids]
-            print "The sample exists in virus.db with ID %s" % (','.join(ids))
-            print "Use the -o or --overwrite option to force"
+
+    engine = create_engine(DBNAME, echo=False)
+    metadata = MetaData(bind=engine)
+
+    samples = Table('samples', metadata,
+            Column('id', Integer, Sequence('samples_id_seq'), primary_key=True),
+            Column('md5', String(32), index=True),
+    )
+
+    detects = Table('detects', metadata,
+            Column('id', Integer, Sequence('detects_id_seq'), primary_key=True),
+            Column('sid', Integer, ForeignKey("samples.id")),
+            Column('vendor', String(255)),
+            Column('name', String(255)),
+    )
+
+    metadata.create_all(checkfirst=True)
+    conn = engine.connect()
+
+    sql = select([samples.c.id]).where(samples.c.md5 == md5)
+    result = conn.execute(sql)
+    ids = result.fetchall()
+
+    if len(ids) == 0:
+        try:
+            sql = samples.insert().values(md5=md5)
+            result = conn.execute(sql)
+        except Exception, e:
+            print "Error inserting record: %s" % e
             return
-        else:
-            curs.execute("DELETE FROM samples WHERE md5=?", (md5,))
 
-    try:
-        curs.execute("INSERT INTO samples VALUES (NULL,?)", (md5,))
-    except Exception, e:
-        print "Error inserting record: %s" % e
-        print "Is your virus.db in a writable path?"
-        return
-        
-    sid = curs.lastrowid 
+    sql = select([func.max(samples.c.id)]).where(samples.c.md5 == md5)
+    result = conn.execute(sql)
+    sid = result.fetchone()['max_1']
+
     print "Added sample to database with ID %d" % sid
+    for key,val in virusresults.items():
+        print "%s => %s" % (key,val)
+        sql = select([detects]).where(and_(detects.c.sid == sid, detects.c.vendor == key)).count()
+        result = conn.execute(sql)
+        cnt = result.fetchone()[0]
+
+        if cnt > 0:
+            sql = detects.update().values(sid=sid, vendor=key, name=val).where(and_(detects.c.sid == sid, detects.c.vendor == key))
+        else:
+            sql = detects.insert().values(sid=sid, vendor=key, name=val)
+
+        result = conn.execute(sql)
+
+def print_result(detects):
     for key,val in detects.items():
-        curs.execute("INSERT INTO detects VALUES (NULL,?,?,?)", (sid, key, val))
-    
-    conn.commit()
-    curs.close()
-
-def initdb():
-
-    if os.path.isfile(DBNAME):
-        print "File already exists, initialization not required."
-        return
-
-    conn = connect(DBNAME)
-    curs = conn.cursor()
-    
-    curs.executescript("""
-        CREATE TABLE samples (
-            id   INTEGER PRIMARY KEY,
-            md5  TEXT
-        );
-    
-        CREATE TABLE detects (
-            id       INTEGER PRIMARY KEY,
-            sid      INTEGER,
-            vendor   TEXT,
-            name     TEXT
-        );
-        """)
-        
-    curs.close()
-    
-    if os.path.isfile(DBNAME):
-        print "Success."
-    else:
-        print "Failed."
+        print "  %s => %s" % (key, val)
 
 def main():
+    detects = {}
+
     parser = OptionParser()
-    parser.add_option("-i", "--init", action="store_true", 
-                       dest="init", default=False, help="initialize virus.db")
-    parser.add_option("-o", "--overwrite", action="store_true",
-                       dest="force", default=False,
-                      help="overwrite existing DB entry")
     parser.add_option("-f", "--file", action="store", dest="filename",
                       type="string", help="upload FILENAME")
     parser.add_option("-v", "--virustotal", action="store_true",
@@ -657,10 +646,6 @@ def main():
     
     (opts, args) = parser.parse_args()
     
-    if opts.init:
-        initdb()
-        sys.exit()
-    
     if opts.filename == None:
         parser.print_help()
         parser.error("You must supply a filename!")
@@ -677,36 +662,36 @@ def main():
             print 'You must install simplejson'
             sys.exit()
         vt = VirusTotal(opts.filename)
-        detects = vt.submit()
-        for key,val in detects.items():
-            print "  %s => %s" % (key, val)
-        savetodb(opts.filename, detects, opts.force)
-        print 
+        result = vt.submit()
+        print_result(result)
+        detects.update(result)
         
     if opts.jotti:
         print "Using Jotti..."
         jotti = Jotti(opts.filename)
-        detects = jotti.submit()
-        for key,val in detects.items():
-            print "  %s => %s" % (key, val)
-        savetodb(opts.filename, detects, opts.force)
-        print 
+        result = jotti.submit()
+        print_result(result)
+        detects.update(result)
         
     if opts.threatexpert:
         print "Using ThreatExpert..."
         te = ThreatExpert(opts.filename)
-        detects = te.submit()
-        for key,val in detects.items():
-            print "  %s => %s" % (key, val)
-        savetodb(opts.filename, detects, opts.force)
-        print 
-        
+        result = te.submit()
+        print_result(result)
+        detects.update(result)
+
     if opts.novirus:
         print "Using NoVirusThanks..."
         nvt = NoVirusThanks(opts.filename)
-        detects = nvt.submit()
-        for key,val in detects.items():
-            print "  %s => %s" % (key, val)
-        
+        result = nvt.submit()
+        print_result(result)
+        detects.update(result)
+
+    if DBENABLED:
+        savetodb(opts.filename, detects)
+    else:
+        print "DB not enabled"
+
+
 if __name__ == '__main__':
     main()
